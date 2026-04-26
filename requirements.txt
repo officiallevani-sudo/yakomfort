@@ -3,4 +3,5 @@ uvicorn
 sqlalchemy
 aiogram
 python-dotenv
-aiosqlite
+httpx
+psycopg2-binary
