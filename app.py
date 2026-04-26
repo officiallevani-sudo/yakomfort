@@ -183,13 +183,22 @@ dp = Dispatcher(storage=MemoryStorage())
 @dp.message(F.text == "/start")
 async def start(m: types.Message, state: FSMContext):
     await state.clear()
-    d = get_driver(m.from_user.id)
-    if d:
-        await m.answer(TEXTS[d[7]]["menu"], reply_markup=get_keyboard(d[7]))
+    
+    # 1. Сначала проверяем, есть ли пользователь в базе водителей
+    driver = get_driver(m.from_user.id)
+    
+    if driver:
+        # Это зарегистрированный водитель
+        lang = driver[7]
+        await m.answer(TEXTS[lang]["menu"], reply_markup=get_keyboard(lang))
+    
     elif m.from_user.id == ADMIN_ID:
-        await m.answer("👨‍💼 Admin panel", reply_markup=get_admin_keyboard())
+        # Это админ (менеджер)
+        await m.answer("👨‍💼 Добро пожаловать в панель менеджера!\n\nНовые заявки будут приходить автоматически.", reply_markup=get_admin_keyboard())
+    
     else:
-        await m.answer(TEXTS["uz"]["register_name"])
+        # Новый пользователь - отправляем на регистрацию
+        await m.answer("🇺🇿 Assalomu alaykum! / 🇷🇺 Добро пожаловать!\n\n" + TEXTS["uz"]["register_name"])
         await state.set_state(RegState.name)
 
 @dp.message(RegState.name)
@@ -215,7 +224,9 @@ async def reg_card(m: types.Message, state: FSMContext):
 @dp.message(F.text.in_(["💰 Balansim", "💰 Мой баланс"]))
 async def show_balance(m: types.Message):
     d = get_driver(m.from_user.id)
-    if not d: return
+    if not d:
+        await m.answer("❌ Iltimos, avval ro'yxatdan o'ting!\n❌ Пожалуйста, сначала зарегистрируйтесь!\n\n/start")
+        return
     balance = d[5]
     available = max(0, balance - 10000)
     await m.answer(TEXTS[d[7]]["balance"].format(balance=int(balance), available=int(available)))
@@ -223,13 +234,17 @@ async def show_balance(m: types.Message):
 @dp.message(F.text.in_(["🚖 Buyurtmalarim", "🚖 Мои заказы"]))
 async def show_orders(m: types.Message):
     d = get_driver(m.from_user.id)
-    if not d: return
+    if not d:
+        await m.answer("❌ Iltimos, avval ro'yxatdan o'ting!\n/start")
+        return
     await m.answer(TEXTS[d[7]]["orders"])
 
 @dp.message(F.text.in_(["💸 Pul yechish", "💸 Вывести деньги"]))
 async def start_withdraw(m: types.Message, state: FSMContext):
     d = get_driver(m.from_user.id)
-    if not d: return
+    if not d:
+        await m.answer("❌ Iltimos, avval ro'yxatdan o'ting!\n/start")
+        return
     balance = d[5]
     available = max(0, balance - 10000)
     if available <= 0:
@@ -261,13 +276,18 @@ async def process_withdraw(m: types.Message, state: FSMContext):
     await state.clear()
     if ADMIN_ID:
         text = TEXTS[d[7]]["new_request"].format(id=wid, name=d[2], phone=d[3], card=d[4][-4:], balance=int(d[5]), amount=int(amount))
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Выплачено", callback_data=f"pay_{wid}"), InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{wid}")]])
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Выплачено", callback_data=f"pay_{wid}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{wid}")
+        ]])
         await bot.send_message(ADMIN_ID, text, reply_markup=kb)
 
 @dp.message(F.text.in_(["📜 To'lovlar tarixi", "📜 История выплат"]))
 async def show_history(m: types.Message):
     d = get_driver(m.from_user.id)
-    if not d: return
+    if not d:
+        await m.answer("❌ Ro'yxatdan o'ting! /start")
+        return
     hist = get_paid_history(d[0])
     if not hist:
         await m.answer(TEXTS[d[7]]["no_history"])
@@ -280,7 +300,9 @@ async def show_history(m: types.Message):
 @dp.message(F.text.in_(["💳 Kartam", "💳 Моя карта"]))
 async def show_card(m: types.Message):
     d = get_driver(m.from_user.id)
-    if not d: return
+    if not d:
+        await m.answer("❌ Ro'yxatdan o'ting! /start")
+        return
     await m.answer(TEXTS[d[7]]["card"].format(card=d[4][-4:]))
 
 @dp.message(F.text.in_(["☎️ Yordam", "☎️ Помощь"]))
@@ -302,6 +324,7 @@ async def change_lang(m: types.Message):
         await m.answer(TEXTS[new]["lang_changed"])
         await m.answer(TEXTS[new]["menu"], reply_markup=get_keyboard(new))
 
+# ============ АДМИН КОМАНДЫ ============
 @dp.message(F.text == "📋 Yangi so'rovlar")
 async def admin_requests(m: types.Message):
     if m.from_user.id != ADMIN_ID: return
@@ -311,7 +334,10 @@ async def admin_requests(m: types.Message):
         return
     for r in reqs:
         text = TEXTS["uz"]["new_request"].format(id=r[0], name=r[6], phone=r[7], card=r[8][-4:], balance=0, amount=int(r[2]))
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Выплачено", callback_data=f"pay_{r[0]}"), InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{r[0]}")]])
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Выплачено", callback_data=f"pay_{r[0]}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{r[0]}")
+        ]])
         await m.answer(text, reply_markup=kb)
 
 @dp.message(F.text == "📊 Statistika")
@@ -333,8 +359,10 @@ async def pay(c: types.CallbackQuery):
     await c.message.edit_text(f"✅ Заявка #{wid} выплачена! Сумма: {int(w[2])} so'm")
     await c.answer("✅ Выплачено!")
     try:
-        lang = get_driver(w[5])[7] if get_driver(w[5]) else "uz"
-        await bot.send_message(w[5], TEXTS[lang]["paid_notify"].format(id=wid, amount=int(w[2])))
+        driver_info = get_driver(w[5])
+        if driver_info:
+            lang = driver_info[7]
+            await bot.send_message(w[5], TEXTS[lang]["paid_notify"].format(id=wid, amount=int(w[2])))
     except: pass
 
 @dp.callback_query(F.data.startswith("reject_"))
