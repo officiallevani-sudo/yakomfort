@@ -14,15 +14,14 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
 
-# Загружаем переменные окружения
 load_dotenv()
 
-# ==================== КОНФИГУРАЦИЯ ====================
+# ==================== КОНФИГ ====================
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./taxi.db")
 DRIVER_BOT_TOKEN = os.getenv("DRIVER_BOT_TOKEN")
 MANAGER_BOT_TOKEN = os.getenv("MANAGER_BOT_TOKEN")
 MANAGER_IDS = [int(x.strip()) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-RESERVE = 10000  # Неснимаемый остаток
+RESERVE = 10000
 
 # ==================== БАЗА ДАННЫХ ====================
 engine = create_async_engine(DATABASE_URL, echo=False)
@@ -56,7 +55,7 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-# ==================== FSM СОСТОЯНИЯ ====================
+# ==================== FSM ====================
 class RegisterStates(StatesGroup):
     waiting_name = State()
     waiting_phone = State()
@@ -76,7 +75,7 @@ def get_manager_keyboard():
     buttons = [[KeyboardButton(text="📋 Новые заявки")]]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
-# ==================== DRIVER BOT ====================
+# ==================== DRIVER BOT (ДОСТУПЕН ВСЕМ) ====================
 driver_bot = Bot(token=DRIVER_BOT_TOKEN)
 storage = MemoryStorage()
 driver_dp = Dispatcher(storage=storage)
@@ -88,9 +87,12 @@ async def driver_start(message: types.Message, state: FSMContext):
         driver = result.scalar_one_or_none()
         
         if driver:
-            await message.answer(f"👋 Здравствуйте, {driver.name}!\n\n💰 Ваш баланс: {driver.balance} сум\n💳 Карта: ****{driver.card[-4:]}", reply_markup=get_driver_keyboard())
+            await message.answer(
+                f"👋 Здравствуйте, {driver.name}!\n\n💰 Ваш баланс: {driver.balance} сум\n💳 Карта: ****{driver.card[-4:]}",
+                reply_markup=get_driver_keyboard()
+            )
         else:
-            await message.answer("🚖 Добро пожаловать в таксопарк!\n\nОтправьте ваше ФИО для регистрации:")
+            await message.answer("🚖 Добро пожаловать в таксопарк Yakomfort!\n\nОтправьте ваше ФИО для регистрации:")
             await state.set_state(RegisterStates.waiting_name)
 
 @driver_dp.message(RegisterStates.waiting_name)
@@ -115,13 +117,13 @@ async def reg_card(message: types.Message, state: FSMContext):
             name=data['name'],
             phone=data['phone'],
             card=message.text,
-            balance=0,
+            balance=350000,  # Тестовый баланс
             status="active"
         )
         db.add(new_driver)
         await db.commit()
         
-        await message.answer("✅ Регистрация завершена!", reply_markup=get_driver_keyboard())
+        await message.answer("✅ Регистрация завершена! Добро пожаловать!", reply_markup=get_driver_keyboard())
         await state.clear()
 
 @driver_dp.message(F.text == "💰 Баланс")
@@ -131,7 +133,11 @@ async def show_balance(message: types.Message):
         driver = result.scalar_one_or_none()
         if driver:
             available = max(0, driver.balance - RESERVE)
-            await message.answer(f"💰 Ваш баланс: {driver.balance} сум\n💸 Доступно к выводу: {available} сум\n⚠️ Неснимаемый остаток: {RESERVE} сум")
+            await message.answer(
+                f"💰 Ваш баланс: {driver.balance} сум\n"
+                f"💸 Доступно к выводу: {available} сум\n"
+                f"⚠️ Неснимаемый остаток: {RESERVE} сум"
+            )
 
 @driver_dp.message(F.text == "💸 Вывести деньги")
 async def withdraw_request(message: types.Message):
@@ -148,20 +154,18 @@ async def withdraw_request(message: types.Message):
             await message.answer(f"❌ Недостаточно средств! Доступно: {available} сум")
             return
         
-        # Проверяем есть ли активная заявка
         active_result = await db.execute(select(Withdraw).where(Withdraw.driver_id == driver.id, Withdraw.status == "new"))
         if active_result.scalar_one_or_none():
             await message.answer("❌ У вас уже есть активная заявка на вывод!")
             return
         
-        # Создаем заявку на всю доступную сумму
         withdraw = Withdraw(driver_id=driver.id, amount=available, status="new")
         db.add(withdraw)
         await db.commit()
         
         await message.answer(f"✅ Заявка на вывод {available} сум отправлена менеджеру!\nНомер заявки: #{withdraw.id}")
         
-        # Уведомляем всех менеджеров
+        # Уведомляем менеджеров
         for mgr_id in MANAGER_IDS:
             try:
                 mgr_bot = Bot(token=MANAGER_BOT_TOKEN)
@@ -213,7 +217,7 @@ async def show_card(message: types.Message):
         if driver:
             await message.answer(f"💳 Ваша карта: ****{driver.card[-4:]}\n\nДля смены карты обратитесь к менеджеру.")
 
-# ==================== MANAGER BOT ====================
+# ==================== MANAGER BOT (ТОЛЬКО ДЛЯ МЕНЕДЖЕРОВ) ====================
 manager_bot = Bot(token=MANAGER_BOT_TOKEN)
 manager_dp = Dispatcher()
 
@@ -271,7 +275,6 @@ async def pay_request(callback: types.CallbackQuery):
         driver_result = await db.execute(select(Driver).where(Driver.id == withdraw.driver_id))
         driver = driver_result.scalar_one_or_none()
         
-        # Обновляем баланс
         driver.balance -= withdraw.amount
         withdraw.status = "paid"
         withdraw.manager_id = callback.from_user.id
@@ -280,7 +283,6 @@ async def pay_request(callback: types.CallbackQuery):
         await callback.message.edit_text(f"✅ Заявка #{withdraw_id} выплачена!\nСумма: {withdraw.amount} сум", reply_markup=None)
         await callback.answer("✅ Выплата подтверждена!")
         
-        # Уведомляем водителя
         try:
             await driver_bot.send_message(
                 driver.telegram_id,
@@ -311,7 +313,6 @@ async def reject_request(callback: types.CallbackQuery):
         await callback.message.edit_text(f"❌ Заявка #{withdraw_id} отклонена!", reply_markup=None)
         await callback.answer("❌ Отклонено!")
         
-        # Уведомляем водителя
         try:
             await driver_bot.send_message(
                 driver.telegram_id,
@@ -338,7 +339,6 @@ async def root():
 async def health():
     return {"status": "healthy"}
 
-# ==================== ЗАПУСК ====================
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
