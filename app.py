@@ -13,25 +13,38 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-# ============ БАЗА ДАННЫХ ============
+# ============ DATABASE ============
 def init_db():
     conn = sqlite3.connect("taxi.db")
-    cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS drivers (
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS drivers (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         telegram_id INTEGER UNIQUE NOT NULL,
         full_name TEXT NOT NULL,
+        car_number TEXT NOT NULL,
         phone TEXT NOT NULL,
         card_number TEXT NOT NULL,
-        balance REAL DEFAULT 350000,
+        balance REAL DEFAULT 0,
+        trips_today INTEGER DEFAULT 0,
+        trips_week INTEGER DEFAULT 0,
+        earnings_today REAL DEFAULT 0,
+        earnings_week REAL DEFAULT 0,
         language TEXT DEFAULT 'uz',
+        status TEXT DEFAULT 'active',
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS withdraw_requests (
+    c.execute('''CREATE TABLE IF NOT EXISTS withdraw_requests (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         driver_id INTEGER NOT NULL,
         amount REAL NOT NULL,
         status TEXT DEFAULT 'new',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        driver_id INTEGER NOT NULL,
+        report_type TEXT,
+        message TEXT,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )''')
     conn.commit()
@@ -47,10 +60,13 @@ def get_driver(tg_id):
     conn.close()
     return r
 
-def create_driver(tg_id, name, phone, card):
+def create_driver(tg_id, name, car_number, phone, card):
     conn = sqlite3.connect("taxi.db")
     c = conn.cursor()
-    c.execute("INSERT INTO drivers (telegram_id, full_name, phone, card_number) VALUES (?,?,?,?)", (tg_id, name, phone, card))
+    c.execute('''INSERT INTO drivers 
+        (telegram_id, full_name, car_number, phone, card_number, balance, trips_today, trips_week, earnings_today, earnings_week, language, status)
+        VALUES (?,?,?,?,?, 0, 0, 0, 0, 0, 'uz', 'active')''', 
+        (tg_id, name, car_number, phone, card))
     conn.commit()
     conn.close()
 
@@ -66,7 +82,8 @@ def create_withdraw(driver_id, amount):
 def get_withdraw(wid):
     conn = sqlite3.connect("taxi.db")
     c = conn.cursor()
-    c.execute("SELECT w.*, d.telegram_id, d.full_name, d.phone, d.card_number, d.balance FROM withdraw_requests w JOIN drivers d ON d.id = w.driver_id WHERE w.id = ?", (wid,))
+    c.execute('''SELECT w.*, d.telegram_id, d.full_name, d.phone, d.card_number, d.balance 
+                FROM withdraw_requests w JOIN drivers d ON d.id = w.driver_id WHERE w.id = ?''', (wid,))
     r = c.fetchone()
     conn.close()
     return r
@@ -96,7 +113,9 @@ def get_paid_history(driver_id):
 def get_new_withdraws():
     conn = sqlite3.connect("taxi.db")
     c = conn.cursor()
-    c.execute("SELECT w.*, d.full_name, d.phone, d.card_number FROM withdraw_requests w JOIN drivers d ON d.id = w.driver_id WHERE w.status = 'new' ORDER BY w.created_at DESC")
+    c.execute('''SELECT w.*, d.full_name, d.phone, d.card_number, d.car_number 
+                FROM withdraw_requests w JOIN drivers d ON d.id = w.driver_id 
+                WHERE w.status = 'new' ORDER BY w.created_at DESC''')
     r = c.fetchall()
     conn.close()
     return r
@@ -113,146 +132,223 @@ def get_stats():
     conn.close()
     return users, total, pending
 
-# ============ ТЕКСТЫ ============
+def add_report(driver_id, report_type, message):
+    conn = sqlite3.connect("taxi.db")
+    c = conn.cursor()
+    c.execute("INSERT INTO reports (driver_id, report_type, message) VALUES (?,?,?)", (driver_id, report_type, message))
+    conn.commit()
+    conn.close()
+
+def update_trips(driver_id, today_count, today_earn, week_count, week_earn):
+    conn = sqlite3.connect("taxi.db")
+    c = conn.cursor()
+    c.execute('''UPDATE drivers SET 
+        trips_today = ?, earnings_today = ?,
+        trips_week = ?, earnings_week = ?
+        WHERE id = ?''', (today_count, today_earn, week_count, week_earn, driver_id))
+    conn.commit()
+    conn.close()
+
+# ============ TEXTS ============
 TEXTS = {
     "uz": {
-        "menu": "💰 Balansim\n🚖 Buyurtmalarim\n💸 Pul yechish\n📜 To'lovlar tarixi\n💳 Kartam\n☎️ Yordam\n🌐 Tilni almashtirish",
+        "welcome": "🚖 Assalomu Alaykum! Yakomfort taksoparkiga xush kelibsiz!\n\n🤝 Biz bilan hamkorlik qiling va daromadingizni oshiring!\n💰 Taksi komissiyasi atigi 1%\n\n🌐 Tilni tanlang / Выберите язык:",
+        "lang_selected": "✅ Til o'zgartirildi / Язык изменен!",
+        "after_reg": "✅ Hurmatli haydovchi, kuningiz unumli va barokatli bo'lsin!\n\n✨ Sizdan yana shuni iltimos qilamiz: mijozlar bilan har doim xushmuomala bo'ling!\n🤝 Yaxshi muomala ikki insonning kayfiyati a'lo darajada bo'lishi kafolatidir!\n\n🚖 Yo'lingiz ochiq bo'lsin!",
+        "register_name": "📝 Ismingizni kiriting:",
+        "register_car": "🚗 Avtotransport raqamingizni kiriting (masalan: 01A777AA):",
+        "register_phone": "📞 Telefon raqamingizni kiriting (+998xxxxxxxxx):",
+        "register_card": "💳 Pul o'tkazish uchun karta raqamingizni kiriting (8600xxxxxx):",
+        "register_success": "🎉 Tabriklaymiz! Siz muvaffaqiyatli ro'yxatdan o'tdingiz!",
+        "register_exists": "❌ Siz allaqachon ro'yxatdan o'tgansiz!",
+        "menu": "📊 Mijozlarim\n💰 Pul yechish\n👨‍💼 Menejer bilan bog'lanish\n🆘 SOS / DTP\n📜 To'lovlar tarixi\n💳 Kartam\n🌐 Til",
+        "my_trips": "🚖 Mijozlarim:\n\n✅ Bugun: {today_count} ta mijoz / {today_earn} so'm\n📊 Hafta: {week_count} ta mijoz / {week_earn} so'm",
         "balance": "💰 Balans: {balance} so'm\n💸 Yechish mumkin: {available} so'm",
-        "enter_amount": "💰 Summani kiriting:",
+        "enter_amount": "💰 Qancha pul yechmoqchisiz?\nSummani kiriting:",
         "insufficient": "❌ Yetarli emas! Yechish mumkin: {available} so'm",
-        "success": "✅ So'rov #{id} yuborildi!",
-        "orders": "🚖 BUGUN: 5 ta / 120000 so'm\n📊 HAFTA: 32 ta / 850000 so'm",
-        "card": "💳 Karta: ****{card}",
-        "help": "☎️ Yordam: +998771202255",
-        "lang_changed": "✅ Til o'zgartirildi!",
+        "success": "✅ So'rovingiz #{id} menedjerga yuborildi!\nTez orada ko'rib chiqiladi.",
+        "card": "💳 Kartangiz: ****{card}",
         "no_history": "📭 To'lovlar tarixi bo'sh",
         "history": "📜 TO'LOVLAR TARIXI:\n",
-        "register_name": "📝 Ism familiyangizni kiriting:",
-        "register_phone": "📞 Telefon raqamingiz:",
-        "register_card": "💳 Karta raqami:",
-        "register_success": "✅ Ro'yxatdan o'tdingiz!",
-        "new_request": "🆕 YANGI SO'ROV #{id}\n\n👤 {name}\n📞 {phone}\n💳 ****{card}\n💰 Balans: {balance}\n💵 Summa: {amount} so'm",
-        "paid_notify": "✅ So'rovingiz #{id} bo'yicha {amount} so'm to'landi!",
+        "contact": "📞 Menejer bilan bog'lanish:\n\n☎️ +998771202255\n📱 @yakomfort_admin",
+        "sos_sent": "🆘 SOS signal yuborildi! Menejer tez orada siz bilan bog'lanadi.\n\n📍 Joylashuvingizni yuboring yoki qisqa vaqt kuting.",
+        "sos_admin": "🆘 SOS SIGNAL!\n\n👤 Haydovchi: {name}\n🚗 Avto: {car}\n📞 Tel: {phone}\n🕐 Vaqt: {time}",
+        "contact_admin": "📞 MURIJAT!\n\n👤 Haydovchi: {name}\n🚗 Avto: {car}\n📞 Tel: {phone}\n💬 Xabar: {msg}\n🕐 Vaqt: {time}",
+        "admin_new": "📋 YANGI SO'ROVLAR:\n\n",
         "admin_no_requests": "📭 Yangi so'rovlar yo'q",
-        "admin_stats": "📊 STATISTIKA\n\n👥 Foydalanuvchilar: {users}\n💰 Jami to'lovlar: {total_paid} so'm\n📝 Kutilayotgan: {pending} ta",
+        "admin_stats": "📊 STATISTIKA\n\n👥 Haydovchilar: {users}\n💰 Jami to'lovlar: {total_paid} so'm\n📝 Kutilayotgan: {pending} ta",
+        "new_withdraw": "🆕 YANGI PUL YECHISH SO'ROVI #{id}\n\n👤 {name}\n🚗 {car}\n📞 {phone}\n💳 ****{card}\n💰 Balans: {balance}\n💵 Summa: {amount} so'm",
+        "paid_notify": "✅ Sizning #{id} so'rovingiz bo'yicha {amount} so'm to'landi!\n💰 Yangi balans: {new_balance} so'm",
+        "reject_notify": "❌ Sizning #{id} so'rovingiz {amount} so'm miqdorida rad etildi!",
     },
     "ru": {
-        "menu": "💰 Мой баланс\n🚖 Мои заказы\n💸 Вывести деньги\n📜 История выплат\n💳 Моя карта\n☎️ Помощь\n🌐 Сменить язык",
+        "welcome": "🚖 Ассаламу Алейкум! Добро пожаловать в таксопарк Yakomfort!\n\n🤝 Сотрудничайте с нами и увеличивайте свой доход!\n💰 Комиссия таксопарка всего 1%\n\n🌐 Выберите язык / Tilni tanlang:",
+        "lang_selected": "✅ Язык изменен / Til o'zgartirildi!",
+        "after_reg": "✅ Уважаемый водитель, пусть ваш рабочий день будет плодотворным и благословенным!\n\n✨ Еще одна просьба: всегда будьте вежливы с клиентами!\n🤝 Хорошее отношение - залог отличного настроения двух людей!\n\n🚖 Счастливого пути!",
+        "register_name": "📝 Введите ваше имя:",
+        "register_car": "🚗 Введите номер автомобиля (например: 01A777AA):",
+        "register_phone": "📞 Введите номер телефона (+998xxxxxxxxx):",
+        "register_card": "💳 Введите номер карты для перевода (8600xxxxxx):",
+        "register_success": "🎉 Поздравляем! Вы успешно зарегистрированы!",
+        "register_exists": "❌ Вы уже зарегистрированы!",
+        "menu": "📊 Мои поездки\n💰 Вывести деньги\n👨‍💼 Связаться с менеджером\n🆘 SOS / ДТП\n📜 История выплат\n💳 Моя карта\n🌐 Язык",
+        "my_trips": "🚖 Мои поездки:\n\n✅ Сегодня: {today_count} поездок / {today_earn} сум\n📊 Неделя: {week_count} поездок / {week_earn} сум",
         "balance": "💰 Баланс: {balance} сум\n💸 Доступно: {available} сум",
-        "enter_amount": "💰 Введите сумму:",
+        "enter_amount": "💰 Введите сумму для вывода:",
         "insufficient": "❌ Недостаточно! Доступно: {available} сум",
-        "success": "✅ Заявка #{id} отправлена!",
-        "orders": "🚖 СЕГОДНЯ: 5 зак / 120000 сум\n📊 НЕДЕЛЯ: 32 зак / 850000 сум",
-        "card": "💳 Карта: ****{card}",
-        "help": "☎️ Помощь: +998771202255",
-        "lang_changed": "✅ Язык изменен!",
+        "success": "✅ Заявка #{id} отправлена менеджеру!\nСкоро будет рассмотрена.",
+        "card": "💳 Ваша карта: ****{card}",
         "no_history": "📭 История выплат пуста",
         "history": "📜 ИСТОРИЯ ВЫПЛАТ:\n",
-        "register_name": "📝 Введите ваше ФИО:",
-        "register_phone": "📞 Введите номер телефона:",
-        "register_card": "💳 Введите номер карты:",
-        "register_success": "✅ Вы зарегистрированы!",
-        "new_request": "🆕 НОВАЯ ЗАЯВКА #{id}\n\n👤 {name}\n📞 {phone}\n💳 ****{card}\n💰 Баланс: {balance}\n💵 Сумма: {amount} сум",
-        "paid_notify": "✅ По вашей заявке #{id} выплачено {amount} сум!",
+        "contact": "📞 Связаться с менеджером:\n\n☎️ +998771202255\n📱 @yakomfort_admin",
+        "sos_sent": "🆘 SOS сигнал отправлен! Менеджер скоро свяжется с вами.\n\n📍 Отправьте ваше местоположение или подождите.",
+        "sos_admin": "🆘 SOS СИГНАЛ!\n\n👤 Водитель: {name}\n🚗 Авто: {car}\n📞 Тел: {phone}\n🕐 Время: {time}",
+        "contact_admin": "📞 ОБРАЩЕНИЕ!\n\n👤 Водитель: {name}\n🚗 Авто: {car}\n📞 Тел: {phone}\n💬 Сообщение: {msg}🕐 Время: {time}",
+        "admin_new": "📋 НОВЫЕ ЗАЯВКИ:\n\n",
         "admin_no_requests": "📭 Новых заявок нет",
-        "admin_stats": "📊 СТАТИСТИКА\n\n👥 Пользователей: {users}\n💰 Всего выплат: {total_paid} сум\n📝 Ожидают: {pending} шт",
+        "admin_stats": "📊 СТАТИСТИКА\n\n👥 Водителей: {users}\n💰 Всего выплат: {total_paid} сум\n📝 Ожидают: {pending} шт",
+        "new_withdraw": "🆕 НОВАЯ ЗАЯВКА НА ВЫВОД #{id}\n\n👤 {name}\n🚗 {car}\n📞 {phone}\n💳 ****{card}\n💰 Баланс: {balance}\n💵 Сумма: {amount} сум",
+        "paid_notify": "✅ По вашей заявке #{id} выплачено {amount} сум!\n💰 Новый баланс: {new_balance} сум",
+        "reject_notify": "❌ Ваша заявка #{id} на сумму {amount} сум отклонена!",
     }
 }
 
-def get_keyboard(lang):
+# ============ KEYBOARDS ============
+def get_main_keyboard(lang):
     texts = TEXTS[lang]["menu"].split("\n")
     buttons = [[KeyboardButton(text=t)] for t in texts]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
+def get_lang_keyboard():
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🇺🇿 O'zbekcha"), KeyboardButton(text="🇷🇺 Русский")]], resize_keyboard=True)
+    return kb
+
 def get_admin_keyboard():
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📋 Yangi so'rovlar"), KeyboardButton(text="📊 Statistika")]], resize_keyboard=True)
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📋 Yangi so'rovlar"), KeyboardButton(text="📊 Statistika")]],
+        resize_keyboard=True
+    )
 
 # ============ FSM ============
 class RegState(StatesGroup):
+    lang = State()
     name = State()
+    car = State()
     phone = State()
     card = State()
 
 class WithdrawState(StatesGroup):
     amount = State()
 
-# ============ БОТ ============
+class ContactState(StatesGroup):
+    message = State()
+
+# ============ BOT ============
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
+# ============ START ============
 @dp.message(F.text == "/start")
-async def start(m: types.Message, state: FSMContext):
+async def start_cmd(m: types.Message, state: FSMContext):
     await state.clear()
     
-    # 1. Сначала проверяем, есть ли пользователь в базе водителей
     driver = get_driver(m.from_user.id)
     
     if driver:
-        # Это зарегистрированный водитель
-        lang = driver[7]
-        await m.answer(TEXTS[lang]["menu"], reply_markup=get_keyboard(lang))
-    
+        lang = driver[11]
+        await m.answer(TEXTS[lang]["menu"], reply_markup=get_main_keyboard(lang))
     elif m.from_user.id == ADMIN_ID:
-        # Это админ (менеджер)
-        await m.answer("👨‍💼 Добро пожаловать в панель менеджера!\n\nНовые заявки будут приходить автоматически.", reply_markup=get_admin_keyboard())
-    
+        await m.answer("👨‍💼 Admin panel", reply_markup=get_admin_keyboard())
     else:
-        # Новый пользователь - отправляем на регистрацию
-        await m.answer("🇺🇿 Assalomu alaykum! / 🇷🇺 Добро пожаловать!\n\n" + TEXTS["uz"]["register_name"])
-        await state.set_state(RegState.name)
+        await state.set_state(RegState.lang)
+        await m.answer(TEXTS["uz"]["welcome"], reply_markup=get_lang_keyboard())
 
+# ============ LANGUAGE SELECTION ============
+@dp.message(RegState.lang, F.text.in_(["🇺🇿 O'zbekcha", "🇷🇺 Русский"]))
+async def select_lang(m: types.Message, state: FSMContext):
+    if m.text == "🇺🇿 O'zbekcha":
+        lang = "uz"
+    else:
+        lang = "ru"
+    
+    await state.update_data(lang=lang)
+    await state.set_state(RegState.name)
+    await m.answer(TEXTS[lang]["register_name"], reply_markup=types.ReplyKeyboardRemove())
+
+# ============ REGISTRATION ============
 @dp.message(RegState.name)
 async def reg_name(m: types.Message, state: FSMContext):
     await state.update_data(name=m.text)
+    await state.set_state(RegState.car)
+    data = await state.get_data()
+    await m.answer(TEXTS[data['lang']]["register_car"])
+
+@dp.message(RegState.car)
+async def reg_car(m: types.Message, state: FSMContext):
+    await state.update_data(car=m.text.upper())
     await state.set_state(RegState.phone)
-    await m.answer(TEXTS["uz"]["register_phone"])
+    data = await state.get_data()
+    await m.answer(TEXTS[data['lang']]["register_phone"])
 
 @dp.message(RegState.phone)
 async def reg_phone(m: types.Message, state: FSMContext):
     await state.update_data(phone=m.text)
     await state.set_state(RegState.card)
-    await m.answer(TEXTS["uz"]["register_card"])
+    data = await state.get_data()
+    await m.answer(TEXTS[data['lang']]["register_card"])
 
 @dp.message(RegState.card)
 async def reg_card(m: types.Message, state: FSMContext):
     data = await state.get_data()
-    create_driver(m.from_user.id, data['name'], data['phone'], m.text)
-    await m.answer(TEXTS["uz"]["register_success"])
-    await m.answer(TEXTS["uz"]["menu"], reply_markup=get_keyboard("uz"))
+    
+    existing = get_driver(m.from_user.id)
+    if existing:
+        await m.answer(TEXTS[data['lang']]["register_exists"])
+        await state.clear()
+        return
+    
+    create_driver(m.from_user.id, data['name'], data['car'], data['phone'], m.text)
+    
+    await m.answer(TEXTS[data['lang']]["register_success"])
+    await m.answer(TEXTS[data['lang']]["after_reg"])
+    await m.answer(TEXTS[data['lang']]["menu"], reply_markup=get_main_keyboard(data['lang']))
     await state.clear()
 
-@dp.message(F.text.in_(["💰 Balansim", "💰 Мой баланс"]))
-async def show_balance(m: types.Message):
-    d = get_driver(m.from_user.id)
-    if not d:
-        await m.answer("❌ Iltimos, avval ro'yxatdan o'ting!\n❌ Пожалуйста, сначала зарегистрируйтесь!\n\n/start")
-        return
-    balance = d[5]
-    available = max(0, balance - 10000)
-    await m.answer(TEXTS[d[7]]["balance"].format(balance=int(balance), available=int(available)))
-
-@dp.message(F.text.in_(["🚖 Buyurtmalarim", "🚖 Мои заказы"]))
-async def show_orders(m: types.Message):
-    d = get_driver(m.from_user.id)
-    if not d:
+# ============ MY TRIPS (MIJOZLAR) ============
+@dp.message(F.text.in_(["📊 Mijozlarim", "📊 Мои поездки"]))
+async def show_trips(m: types.Message):
+    driver = get_driver(m.from_user.id)
+    if not driver:
         await m.answer("❌ Iltimos, avval ro'yxatdan o'ting!\n/start")
         return
-    await m.answer(TEXTS[d[7]]["orders"])
+    
+    lang = driver[11]
+    await m.answer(TEXTS[lang]["my_trips"].format(
+        today_count=int(driver[6] or 0),
+        today_earn=int(driver[7] or 0),
+        week_count=int(driver[8] or 0),
+        week_earn=int(driver[9] or 0)
+    ))
 
-@dp.message(F.text.in_(["💸 Pul yechish", "💸 Вывести деньги"]))
+# ============ WITHDRAW ============
+@dp.message(F.text.in_(["💰 Pul yechish", "💰 Вывести деньги"]))
 async def start_withdraw(m: types.Message, state: FSMContext):
-    d = get_driver(m.from_user.id)
-    if not d:
+    driver = get_driver(m.from_user.id)
+    if not driver:
         await m.answer("❌ Iltimos, avval ro'yxatdan o'ting!\n/start")
         return
-    balance = d[5]
-    available = max(0, balance - 10000)
+    
+    lang = driver[11]
+    balance = driver[5]
+    available = max(0, balance)
+    
     if available <= 0:
-        await m.answer(TEXTS[d[7]]["insufficient"].format(available=0))
+        await m.answer(TEXTS[lang]["insufficient"].format(available=0))
         return
-    await state.update_data(driver_id=d[0])
+    
+    await state.update_data(driver_id=driver[0])
     await state.set_state(WithdrawState.amount)
-    await m.answer(TEXTS[d[7]]["enter_amount"])
+    await m.answer(TEXTS[lang]["enter_amount"])
 
 @dp.message(WithdrawState.amount)
 async def process_withdraw(m: types.Message, state: FSMContext):
@@ -260,89 +356,186 @@ async def process_withdraw(m: types.Message, state: FSMContext):
         amount = float(m.text)
         if amount <= 0: raise ValueError
     except:
-        await m.answer("❌ Faqat son kiriting!")
+        await m.answer("❌ Iltimos, to'g'ri summa kiriting!")
         return
+    
     data = await state.get_data()
     driver_id = data['driver_id']
-    d = get_driver(driver_id)
-    if not d: return
-    available = max(0, d[5] - 10000)
-    if amount > available:
-        await m.answer(TEXTS[d[7]]["insufficient"].format(available=int(available)))
+    driver = get_driver(driver_id)
+    if not driver: return
+    
+    lang = driver[11]
+    balance = driver[5]
+    
+    if amount > balance:
+        await m.answer(TEXTS[lang]["insufficient"].format(available=int(balance)))
         await state.clear()
         return
+    
     wid = create_withdraw(driver_id, amount)
-    await m.answer(TEXTS[d[7]]["success"].format(id=wid))
+    await m.answer(TEXTS[lang]["success"].format(id=wid))
     await state.clear()
+    
     if ADMIN_ID:
-        text = TEXTS[d[7]]["new_request"].format(id=wid, name=d[2], phone=d[3], card=d[4][-4:], balance=int(d[5]), amount=int(amount))
+        text = TEXTS[lang]["new_withdraw"].format(
+            id=wid, 
+            name=driver[2], 
+            car=driver[3], 
+            phone=driver[4], 
+            card=driver[5][-4:], 
+            balance=int(balance), 
+            amount=int(amount)
+        )
         kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Выплачено", callback_data=f"pay_{wid}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{wid}")
+            InlineKeyboardButton(text="✅ To'landi", callback_data=f"pay_{wid}"),
+            InlineKeyboardButton(text="❌ Rad etish", callback_data=f"reject_{wid}")
         ]])
         await bot.send_message(ADMIN_ID, text, reply_markup=kb)
 
+# ============ HISTORY ============
 @dp.message(F.text.in_(["📜 To'lovlar tarixi", "📜 История выплат"]))
 async def show_history(m: types.Message):
-    d = get_driver(m.from_user.id)
-    if not d:
-        await m.answer("❌ Ro'yxatdan o'ting! /start")
+    driver = get_driver(m.from_user.id)
+    if not driver:
+        await m.answer("❌ Ro'yxatdan o'ting!\n/start")
         return
-    hist = get_paid_history(d[0])
+    
+    lang = driver[11]
+    hist = get_paid_history(driver[0])
+    
     if not hist:
-        await m.answer(TEXTS[d[7]]["no_history"])
+        await m.answer(TEXTS[lang]["no_history"])
         return
-    text = TEXTS[d[7]]["history"]
+    
+    text = TEXTS[lang]["history"]
     for h in hist:
         text += f"#{h[0]} - {int(h[2])} so'm - {h[5][:16]}\n"
     await m.answer(text)
 
+# ============ CARD ============
 @dp.message(F.text.in_(["💳 Kartam", "💳 Моя карта"]))
 async def show_card(m: types.Message):
-    d = get_driver(m.from_user.id)
-    if not d:
-        await m.answer("❌ Ro'yxatdan o'ting! /start")
+    driver = get_driver(m.from_user.id)
+    if not driver:
+        await m.answer("❌ Ro'yxatdan o'ting!\n/start")
         return
-    await m.answer(TEXTS[d[7]]["card"].format(card=d[4][-4:]))
+    
+    lang = driver[11]
+    card = driver[5][-4:] if len(driver[5]) >= 4 else "****"
+    await m.answer(TEXTS[lang]["card"].format(card=card))
 
-@dp.message(F.text.in_(["☎️ Yordam", "☎️ Помощь"]))
-async def show_help(m: types.Message):
-    d = get_driver(m.from_user.id)
-    lang = d[7] if d else "uz"
-    await m.answer(TEXTS[lang]["help"])
+# ============ CONTACT MANAGER ============
+@dp.message(F.text.in_(["👨‍💼 Menejer bilan bog'lanish", "👨‍💼 Связаться с менеджером"]))
+async def contact_manager(m: types.Message, state: FSMContext):
+    driver = get_driver(m.from_user.id)
+    if not driver:
+        await m.answer("❌ Ro'yxatdan o'ting!\n/start")
+        return
+    
+    lang = driver[11]
+    await state.set_state(ContactState.message)
+    await m.answer(TEXTS[lang]["contact"] + "\n\n✍️ Xabaringizni yozing:")
 
-@dp.message(F.text.in_(["🌐 Tilni almashtirish", "🌐 Сменить язык"]))
+@dp.message(ContactState.message)
+async def send_manager_msg(m: types.Message, state: FSMContext):
+    driver = get_driver(m.from_user.id)
+    if not driver:
+        await state.clear()
+        return
+    
+    lang = driver[11]
+    msg = m.text
+    
+    if ADMIN_ID:
+        text = TEXTS[lang]["contact_admin"].format(
+            name=driver[2],
+            car=driver[3],
+            phone=driver[4],
+            msg=msg,
+            time=datetime.now().strftime("%H:%M:%S")
+        )
+        await bot.send_message(ADMIN_ID, text)
+    
+    await m.answer("✅ Xabaringiz menedjerga yuborildi!\nTez orada javob olasiz.")
+    await state.clear()
+
+# ============ SOS / DTP ============
+@dp.message(F.text.in_(["🆘 SOS / DTP", "🆘 SOS / ДТП"]))
+async def sos_signal(m: types.Message):
+    driver = get_driver(m.from_user.id)
+    if not driver:
+        await m.answer("❌ Ro'yxatdan o'ting!\n/start")
+        return
+    
+    lang = driver[11]
+    
+    add_report(driver[0], "sos", "SOS signal")
+    
+    if ADMIN_ID:
+        text = TEXTS[lang]["sos_admin"].format(
+            name=driver[2],
+            car=driver[3],
+            phone=driver[4],
+            time=datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+        )
+        await bot.send_message(ADMIN_ID, text)
+    
+    await m.answer(TEXTS[lang]["sos_sent"])
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📍 Joylashuvni yuborish", callback_data="send_location")
+    ]])
+    await m.answer("📍 Joylashuvingizni yuboring:", reply_markup=kb)
+
+@dp.callback_query(F.data == "send_location")
+async def send_location(c: types.CallbackQuery):
+    await c.message.answer("📍 Joylashuvingizni yuborish uchun \"📍 Joylashuv\" tugmasini bosing:")
+    await c.answer()
+
+# ============ CHANGE LANGUAGE ============
+@dp.message(F.text.in_(["🌐 Til", "🌐 Язык"]))
 async def change_lang(m: types.Message):
-    d = get_driver(m.from_user.id)
-    if d:
-        new = "ru" if d[7] == "uz" else "uz"
-        conn = sqlite3.connect("taxi.db")
-        c = conn.cursor()
-        c.execute("UPDATE drivers SET language = ? WHERE telegram_id = ?", (new, m.from_user.id))
-        conn.commit()
-        conn.close()
-        await m.answer(TEXTS[new]["lang_changed"])
-        await m.answer(TEXTS[new]["menu"], reply_markup=get_keyboard(new))
+    driver = get_driver(m.from_user.id)
+    if not driver:
+        await m.answer("❌ Ro'yxatdan o'ting!\n/start")
+        return
+    
+    new_lang = "ru" if driver[11] == "uz" else "uz"
+    
+    conn = sqlite3.connect("taxi.db")
+    c = conn.cursor()
+    c.execute("UPDATE drivers SET language = ? WHERE telegram_id = ?", (new_lang, m.from_user.id))
+    conn.commit()
+    conn.close()
+    
+    await m.answer(TEXTS[new_lang]["lang_selected"])
+    await m.answer(TEXTS[new_lang]["menu"], reply_markup=get_main_keyboard(new_lang))
 
-# ============ АДМИН КОМАНДЫ ============
+# ============ ADMIN COMMANDS ============
 @dp.message(F.text == "📋 Yangi so'rovlar")
 async def admin_requests(m: types.Message):
     if m.from_user.id != ADMIN_ID: return
+    
     reqs = get_new_withdraws()
     if not reqs:
         await m.answer(TEXTS["uz"]["admin_no_requests"])
         return
+    
+    await m.answer(TEXTS["uz"]["admin_new"])
     for r in reqs:
-        text = TEXTS["uz"]["new_request"].format(id=r[0], name=r[6], phone=r[7], card=r[8][-4:], balance=0, amount=int(r[2]))
+        text = TEXTS["uz"]["new_withdraw"].format(
+            id=r[0], name=r[6], car=r[9], phone=r[7], card=r[8][-4:], balance=0, amount=int(r[2])
+        )
         kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Выплачено", callback_data=f"pay_{r[0]}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{r[0]}")
+            InlineKeyboardButton(text="✅ To'landi", callback_data=f"pay_{r[0]}"),
+            InlineKeyboardButton(text="❌ Rad etish", callback_data=f"reject_{r[0]}")
         ]])
         await m.answer(text, reply_markup=kb)
 
 @dp.message(F.text == "📊 Statistika")
 async def admin_stats(m: types.Message):
     if m.from_user.id != ADMIN_ID: return
+    
     users, total, pending = get_stats()
     await m.answer(TEXTS["uz"]["admin_stats"].format(users=users, total_paid=int(total), pending=pending))
 
@@ -350,35 +543,69 @@ async def admin_stats(m: types.Message):
 async def pay(c: types.CallbackQuery):
     wid = int(c.data.split("_")[1])
     w = get_withdraw(wid)
+    
     if not w or w[3] != "new":
         await c.answer("❌ So'rov topilmadi yoki ishlangan!")
         return
+    
     new_balance = w[11] - w[2]
     update_driver_balance(w[1], new_balance)
     update_withdraw_status(wid, "paid")
-    await c.message.edit_text(f"✅ Заявка #{wid} выплачена! Сумма: {int(w[2])} so'm")
-    await c.answer("✅ Выплачено!")
+    
+    await c.message.edit_text(f"✅ #{wid} to'landi! Summa: {int(w[2])} so'm")
+    await c.answer("✅ To'landi!")
+    
     try:
         driver_info = get_driver(w[5])
         if driver_info:
-            lang = driver_info[7]
-            await bot.send_message(w[5], TEXTS[lang]["paid_notify"].format(id=wid, amount=int(w[2])))
+            lang = driver_info[11]
+            await bot.send_message(w[5], TEXTS[lang]["paid_notify"].format(
+                id=wid, 
+                amount=int(w[2]),
+                new_balance=int(new_balance)
+            ))
     except: pass
 
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject(c: types.CallbackQuery):
     wid = int(c.data.split("_")[1])
     w = get_withdraw(wid)
+    
     if not w or w[3] != "new":
         await c.answer("❌ So'rov topilmadi yoki ishlangan!")
         return
+    
     update_withdraw_status(wid, "rejected")
-    await c.message.edit_text(f"❌ Заявка #{wid} отклонена!")
-    await c.answer("❌ Отклонено!")
+    await c.message.edit_text(f"❌ #{wid} rad etildi!")
+    await c.answer("❌ Rad etildi!")
+    
     try:
-        await bot.send_message(w[5], f"❌ Sizning #{wid} so'rovingiz {int(w[2])} so'm miqdorida rad etildi!")
+        await bot.send_message(w[5], TEXTS["uz"]["reject_notify"].format(id=wid, amount=int(w[2])))
     except: pass
 
+# ============ UPDATE TRIPS (Admin can update) ============
+@dp.message(F.text.startswith("/update_trips"))
+async def update_trips_cmd(m: types.Message):
+    if m.from_user.id != ADMIN_ID: return
+    
+    parts = m.text.split()
+    if len(parts) != 6:
+        await m.answer("❌ Ishlatish: /update_trips driver_id today_count today_earn week_count week_earn")
+        return
+    
+    try:
+        driver_id = int(parts[1])
+        today_count = int(parts[2])
+        today_earn = float(parts[3])
+        week_count = int(parts[4])
+        week_earn = float(parts[5])
+        
+        update_trips(driver_id, today_count, today_earn, week_count, week_earn)
+        await m.answer(f"✅ Haydovchi #{driver_id} ma'lumotlari yangilandi!")
+    except Exception as e:
+        await m.answer(f"❌ Xatolik: {e}")
+
+# ============ MAIN ============
 async def main():
     print("Bot ishlayapti...")
     await dp.start_polling(bot)
