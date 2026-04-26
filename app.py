@@ -9,6 +9,9 @@ from sqlalchemy.orm import declarative_base
 from sqlalchemy import Column, Integer, String, Float, BigInteger, DateTime, select
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
 
 # Загружаем переменные окружения
@@ -53,6 +56,12 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+# ==================== FSM СОСТОЯНИЯ ====================
+class RegisterStates(StatesGroup):
+    waiting_name = State()
+    waiting_phone = State()
+    waiting_card = State()
+
 # ==================== КЛАВИАТУРЫ ====================
 def get_driver_keyboard():
     buttons = [
@@ -69,10 +78,11 @@ def get_manager_keyboard():
 
 # ==================== DRIVER BOT ====================
 driver_bot = Bot(token=DRIVER_BOT_TOKEN)
-driver_dp = Dispatcher()
+storage = MemoryStorage()
+driver_dp = Dispatcher(storage=storage)
 
 @driver_dp.message(F.text == "/start")
-async def driver_start(message: types.Message):
+async def driver_start(message: types.Message, state: FSMContext):
     async for db in get_db():
         result = await db.execute(select(Driver).where(Driver.telegram_id == message.from_user.id))
         driver = result.scalar_one_or_none()
@@ -81,7 +91,38 @@ async def driver_start(message: types.Message):
             await message.answer(f"👋 Здравствуйте, {driver.name}!\n\n💰 Ваш баланс: {driver.balance} сум\n💳 Карта: ****{driver.card[-4:]}", reply_markup=get_driver_keyboard())
         else:
             await message.answer("🚖 Добро пожаловать в таксопарк!\n\nОтправьте ваше ФИО для регистрации:")
-            await driver_dp.state.set_state("waiting_name")
+            await state.set_state(RegisterStates.waiting_name)
+
+@driver_dp.message(RegisterStates.waiting_name)
+async def reg_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await state.set_state(RegisterStates.waiting_phone)
+    await message.answer("📞 Отправьте номер телефона (например: +998901234567):")
+
+@driver_dp.message(RegisterStates.waiting_phone)
+async def reg_phone(message: types.Message, state: FSMContext):
+    await state.update_data(phone=message.text)
+    await state.set_state(RegisterStates.waiting_card)
+    await message.answer("💳 Отправьте номер карты (например: 8600123456789012):")
+
+@driver_dp.message(RegisterStates.waiting_card)
+async def reg_card(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    
+    async for db in get_db():
+        new_driver = Driver(
+            telegram_id=message.from_user.id,
+            name=data['name'],
+            phone=data['phone'],
+            card=message.text,
+            balance=0,
+            status="active"
+        )
+        db.add(new_driver)
+        await db.commit()
+        
+        await message.answer("✅ Регистрация завершена!", reply_markup=get_driver_keyboard())
+        await state.clear()
 
 @driver_dp.message(F.text == "💰 Баланс")
 async def show_balance(message: types.Message):
@@ -108,8 +149,8 @@ async def withdraw_request(message: types.Message):
             return
         
         # Проверяем есть ли активная заявка
-        active = await db.execute(select(Withdraw).where(Withdraw.driver_id == driver.id, Withdraw.status == "new"))
-        if active.scalar_one_or_none():
+        active_result = await db.execute(select(Withdraw).where(Withdraw.driver_id == driver.id, Withdraw.status == "new"))
+        if active_result.scalar_one_or_none():
             await message.answer("❌ У вас уже есть активная заявка на вывод!")
             return
         
@@ -149,11 +190,11 @@ async def show_history(message: types.Message):
         if not driver:
             return
         
-        history = await db.execute(
+        history_result = await db.execute(
             select(Withdraw).where(Withdraw.driver_id == driver.id, Withdraw.status == "paid")
             .order_by(Withdraw.created_at.desc()).limit(10)
         )
-        history_list = history.scalars().all()
+        history_list = history_result.scalars().all()
         
         if not history_list:
             await message.answer("📭 История выплат пуста")
@@ -171,38 +212,6 @@ async def show_card(message: types.Message):
         driver = result.scalar_one_or_none()
         if driver:
             await message.answer(f"💳 Ваша карта: ****{driver.card[-4:]}\n\nДля смены карты обратитесь к менеджеру.")
-
-# Регистрация (FSM через простые состояния)
-@driver_dp.message(F.text, driver_dp.state.is_state("waiting_name"))
-async def reg_name(message: types.Message):
-    await driver_dp.state.update_data(name=message.text)
-    await driver_dp.state.set_state("waiting_phone")
-    await message.answer("📞 Отправьте номер телефона (например: +998901234567):")
-
-@driver_dp.message(F.text, driver_dp.state.is_state("waiting_phone"))
-async def reg_phone(message: types.Message):
-    await driver_dp.state.update_data(phone=message.text)
-    await driver_dp.state.set_state("waiting_card")
-    await message.answer("💳 Отправьте номер карты (например: 8600123456789012):")
-
-@driver_dp.message(F.text, driver_dp.state.is_state("waiting_card"))
-async def reg_card(message: types.Message):
-    data = await driver_dp.state.get_data()
-    
-    async for db in get_db():
-        new_driver = Driver(
-            telegram_id=message.from_user.id,
-            name=data['name'],
-            phone=data['phone'],
-            card=message.text,
-            balance=0,
-            status="active"
-        )
-        db.add(new_driver)
-        await db.commit()
-        
-        await message.answer("✅ Регистрация завершена!", reply_markup=get_driver_keyboard())
-        await driver_dp.state.clear()
 
 # ==================== MANAGER BOT ====================
 manager_bot = Bot(token=MANAGER_BOT_TOKEN)
@@ -314,13 +323,9 @@ async def reject_request(callback: types.CallbackQuery):
 # ==================== FASTAPI ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Инициализируем базу данных
     await init_db()
-    
-    # Запускаем ботов
     asyncio.create_task(driver_dp.start_polling(driver_bot))
     asyncio.create_task(manager_dp.start_polling(manager_bot))
-    
     yield
 
 app = FastAPI(title="Taxi Payout System", lifespan=lifespan)
