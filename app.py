@@ -1,669 +1,514 @@
 import os
-import asyncio
-import json
-import hashlib
-from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Tuple
-from contextlib import asynccontextmanager
-from pathlib import Path
-import threading
-
-from fastapi import FastAPI, Request, Query, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, BigInteger, Boolean, Text, select, func
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+import sqlite3
+from datetime import datetime
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
-import httpx
 
 load_dotenv()
 
-# ==================== КОНФИГУРАЦИЯ ====================
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/taxi_db")
-DRIVER_BOT_TOKEN = os.getenv("DRIVER_BOT_TOKEN")
-MANAGER_BOT_TOKEN = os.getenv("MANAGER_BOT_TOKEN")
-YANDEX_CLIENT_ID = os.getenv("YANDEX_CLIENT_ID")
-YANDEX_API_KEY = os.getenv("YANDEX_API_KEY")
-YANDEX_PARK_ID = os.getenv("YANDEX_PARK_ID")
-MANAGER_IDS = [int(x.strip()) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-NON_WITHDRAWABLE = int(os.getenv("NON_WITHDRAWABLE", "10000"))
-PORT = int(os.getenv("PORT", "8000"))
+# ==================== КОНФИГ ====================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # ТВОЙ TELEGRAM ID!
 
 # ==================== БАЗА ДАННЫХ ====================
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+def init_db():
+    conn = sqlite3.connect("taxi.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS drivers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER UNIQUE NOT NULL,
+            full_name TEXT NOT NULL,
+            phone TEXT NOT NULL,
+            card_number TEXT NOT NULL,
+            balance REAL DEFAULT 350000,
+            language TEXT DEFAULT 'uz',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS withdraw_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            driver_id INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            status TEXT DEFAULT 'new',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-class Driver(Base):
-    __tablename__ = "drivers"
-    id = Column(Integer, primary_key=True)
-    telegram_id = Column(BigInteger, unique=True, nullable=False)
-    full_name = Column(String(255), nullable=False)
-    phone = Column(String(50), nullable=False)
-    yandex_driver_id = Column(String(100), nullable=False)
-    card_number = Column(String(50), nullable=False)
-    status = Column(String(20), default="pending")
-    balance = Column(Float, default=0)
-    language = Column(String(10), default="uz")
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+init_db()
 
-class WithdrawRequest(Base):
-    __tablename__ = "withdraw_requests"
-    id = Column(Integer, primary_key=True)
-    driver_id = Column(Integer, nullable=False)
-    amount = Column(Float, nullable=False)
-    status = Column(String(20), default="new")
-    manager_id = Column(Integer, nullable=True)
-    manager_telegram_id = Column(BigInteger, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    completed_at = Column(DateTime, nullable=True)
+def is_admin(telegram_id):
+    return telegram_id == ADMIN_ID
 
-class PayoutLog(Base):
-    __tablename__ = "payout_logs"
-    id = Column(Integer, primary_key=True)
-    withdraw_id = Column(Integer, nullable=False)
-    driver_id = Column(Integer, nullable=False)
-    amount = Column(Float, nullable=False)
-    previous_balance = Column(Float, nullable=False)
-    new_balance = Column(Float, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+def get_driver(telegram_id):
+    conn = sqlite3.connect("taxi.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM drivers WHERE telegram_id = ?", (telegram_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row
 
-Base.metadata.create_all(bind=engine)
+def create_driver(telegram_id, name, phone, card):
+    conn = sqlite3.connect("taxi.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO drivers (telegram_id, full_name, phone, card_number, balance, language)
+        VALUES (?, ?, ?, ?, 350000, 'uz')
+    ''', (telegram_id, name, phone, card))
+    conn.commit()
+    conn.close()
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+def create_withdraw(driver_id, amount):
+    conn = sqlite3.connect("taxi.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO withdraw_requests (driver_id, amount, status)
+        VALUES (?, ?, 'new')
+    ''', (driver_id, amount))
+    conn.commit()
+    withdraw_id = cursor.lastrowid
+    conn.close()
+    return withdraw_id
 
-# ==================== YANDEX FLEET API ====================
-class YandexFleetAPI:
-    def __init__(self):
-        self.base_url = "https://fleet-api.taxi.yandex.net/v1/parks"
-        self.client_id = YANDEX_CLIENT_ID
-        self.api_key = YANDEX_API_KEY
-        self.park_id = YANDEX_PARK_ID
+def get_withdraw(withdraw_id):
+    conn = sqlite3.connect("taxi.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT w.*, d.full_name, d.phone, d.card_number, d.telegram_id as driver_tg
+        FROM withdraw_requests w
+        JOIN drivers d ON d.id = w.driver_id
+        WHERE w.id = ?
+    ''', (withdraw_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row
 
-    async def _request(self, method: str, endpoint: str, data: Dict = None):
-        if not self.client_id or not self.api_key:
-            return None
-        url = f"{self.base_url}/{endpoint}"
-        headers = {
-            "X-Client-ID": self.client_id,
-            "X-API-Key": self.api_key,
-            "Content-Type": "application/json"
-        }
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                if method == "GET":
-                    response = await client.get(url, headers=headers, params=data)
-                else:
-                    response = await client.post(url, headers=headers, json=data)
-                if response.status_code == 200:
-                    return response.json()
-        except Exception as e:
-            print(f"Yandex API error: {e}")
-        return None
+def get_new_withdraws():
+    conn = sqlite3.connect("taxi.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT w.*, d.full_name, d.phone, d.card_number
+        FROM withdraw_requests w
+        JOIN drivers d ON d.id = w.driver_id
+        WHERE w.status = 'new'
+        ORDER BY w.created_at DESC
+    ''')
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
 
-    async def get_driver_balance(self, driver_id: str) -> float:
-        data = {"query": {"park": {"id": self.park_id}, "driver": {"id": driver_id}}}
-        result = await self._request("POST", "drivers", data)
-        if result and result.get("drivers"):
-            return float(result["drivers"][0].get("balance", {}).get("total", 0))
-        return 0
+def update_withdraw_status(withdraw_id, status):
+    conn = sqlite3.connect("taxi.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE withdraw_requests SET status = ? WHERE id = ?", (status, withdraw_id))
+    conn.commit()
+    conn.close()
 
-    async def get_driver_orders(self, driver_id: str, date_from: str, date_to: str) -> Dict:
-        data = {
-            "query": {
-                "park": {"id": self.park_id},
-                "driver": {"id": driver_id},
-                "order": {"statuses": ["complete"], "date_from": date_from, "date_to": date_to}
-            }
-        }
-        result = await self._request("POST", "orders", data)
-        if result:
-            orders = result.get("orders", [])
-            return {"orders": len(orders), "earned": sum(float(o.get("price", 0)) for o in orders)}
-        return {"orders": 0, "earned": 0}
+def get_driver_balance(driver_id):
+    conn = sqlite3.connect("taxi.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT balance FROM drivers WHERE id = ?", (driver_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else 0
 
-yandex_api = YandexFleetAPI()
+def update_driver_balance(driver_id, new_balance):
+    conn = sqlite3.connect("taxi.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE drivers SET balance = ? WHERE id = ?", (new_balance, driver_id))
+    conn.commit()
+    conn.close()
+
+def get_paid_history(driver_id):
+    conn = sqlite3.connect("taxi.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT * FROM withdraw_requests 
+        WHERE driver_id = ? AND status = 'paid' 
+        ORDER BY created_at DESC LIMIT 10
+    ''', (driver_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def get_stats():
+    conn = sqlite3.connect("taxi.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM drivers")
+    users = cursor.fetchone()[0]
+    cursor.execute("SELECT SUM(amount) FROM withdraw_requests WHERE status = 'paid'")
+    total_paid = cursor.fetchone()[0] or 0
+    cursor.execute("SELECT COUNT(*) FROM withdraw_requests WHERE status = 'new'")
+    pending = cursor.fetchone()[0]
+    conn.close()
+    return users, total_paid, pending
 
 # ==================== ТЕКСТЫ ====================
 TEXTS = {
     "uz": {
-        "welcome": "🚖 Yakomfort taksoparkiga xush kelibsiz!",
         "menu": "💰 Balansim\n🚖 Buyurtmalarim\n💸 Pul yechish\n📜 To'lovlar tarixi\n💳 Kartam\n☎️ Yordam\n🌐 Tilni almashtirish",
-        "balance": "💰 Balansingiz:\n\nJami: {balance} so'm\nYechish mumkin: {available} so'm\n⚠️ Minimal qoldiq: 10000 so'm",
-        "enter_amount": "💰 Yechmoqchi bo'lgan summani kiriting:",
+        "balance": "💰 Balans: {balance} so'm\n💸 Yechish mumkin: {available} so'm",
+        "enter_amount": "💰 Summani kiriting:",
         "insufficient": "❌ Yetarli emas! Yechish mumkin: {available} so'm",
         "success": "✅ So'rov #{id} yuborildi!",
-        "blocked": "❌ Hisobingiz bloklangan",
-        "active_request": "❌ Sizda faol so'rov mavjud",
-        "orders_today": "🚖 BUGUN:\n📦 {orders} ta buyurtma\n💰 {earned} so'm",
-        "orders_week": "📊 HAFTA:\n📦 {orders} ta buyurtma\n💰 {earned} so'm",
-        "card": "💳 Karta: ****{card}\n🔄 O'zgartirish uchun menedjerga murojaat qiling",
-        "help": "☎️ Yordam: +998 71 202 55 55",
+        "orders": "🚖 BUGUN: 5 ta / 120000 so'm\n📊 HAFTA: 32 ta / 850000 so'm",
+        "card": "💳 Karta: ****{card}",
+        "help": "☎️ Yordam: +998771202255",
         "lang_changed": "✅ Til o'zgartirildi!",
         "no_history": "📭 To'lovlar tarixi bo'sh",
-        "history_header": "📜 TO'LOVLAR TARIXI:\n",
+        "history": "📜 TO'LOVLAR TARIXI:\n",
         "register_name": "📝 Ism familiyangizni kiriting:",
-        "register_phone": "📞 Telefon raqamingizni kiriting (+998xxxxxxxxx):",
-        "register_yandex": "🆔 Yandex Driver ID ni kiriting:",
-        "register_card": "💳 Karta raqamingizni kiriting (8600xxxxxx):",
-        "register_success": "✅ Ro'yxatdan o'tdingiz! Menedjer tasdiqlashidan keyin hisobingiz faollashadi.",
-        "register_exists": "❌ Siz allaqachon ro'yxatdan o'tgansiz!",
+        "register_phone": "📞 Telefon raqamingiz:",
+        "register_card": "💳 Karta raqami:",
+        "register_success": "✅ Ro'yxatdan o'tdingiz!",
+        "new_request": "🆕 YANGI SO'ROV #{id}\n\n👤 {name}\n📞 {phone}\n💳 ****{card}\n💰 Balans: {balance}\n💵 Summa: {amount} so'm",
+        "paid_notify": "✅ Sizning #{id} so'rovingiz bo'yicha {amount} so'm to'landi!",
+        "admin_new": "📋 Yangi so'rovlar:",
+        "admin_no_requests": "📭 Yangi so'rovlar yo'q",
+        "admin_stats": "📊 STATISTIKA\n\n👥 Foydalanuvchilar: {users}\n💰 Jami to'lovlar: {total_paid} so'm\n📝 Kutilayotgan: {pending} ta",
     },
     "ru": {
-        "welcome": "🚖 Добро пожаловать в таксопарк Yakomfort!",
         "menu": "💰 Мой баланс\n🚖 Мои заказы\n💸 Вывести деньги\n📜 История выплат\n💳 Моя карта\n☎️ Помощь\n🌐 Сменить язык",
-        "balance": "💰 Ваш баланс:\n\nВсего: {balance} сум\nДоступно: {available} сум\n⚠️ Минимальный остаток: 10000 сум",
-        "enter_amount": "💰 Введите сумму для вывода:",
+        "balance": "💰 Баланс: {balance} сум\n💸 Доступно: {available} сум",
+        "enter_amount": "💰 Введите сумму:",
         "insufficient": "❌ Недостаточно! Доступно: {available} сум",
         "success": "✅ Заявка #{id} отправлена!",
-        "blocked": "❌ Ваш аккаунт заблокирован",
-        "active_request": "❌ У вас есть активная заявка",
-        "orders_today": "🚖 СЕГОДНЯ:\n📦 {orders} заказов\n💰 {earned} сум",
-        "orders_week": "📊 НЕДЕЛЯ:\n📦 {orders} заказов\n💰 {earned} сум",
-        "card": "💳 Карта: ****{card}\n🔄 Для смены карты обратитесь к менеджеру",
-        "help": "☎️ Помощь: +998 71 202 55 55",
+        "orders": "🚖 СЕГОДНЯ: 5 зак / 120000 сум\n📊 НЕДЕЛЯ: 32 зак / 850000 сум",
+        "card": "💳 Карта: ****{card}",
+        "help": "☎️ Помощь: +998771202255",
         "lang_changed": "✅ Язык изменен!",
         "no_history": "📭 История выплат пуста",
-        "history_header": "📜 ИСТОРИЯ ВЫПЛАТ:\n",
+        "history": "📜 ИСТОРИЯ ВЫПЛАТ:\n",
         "register_name": "📝 Введите ваше ФИО:",
-        "register_phone": "📞 Введите номер телефона (+998xxxxxxxxx):",
-        "register_yandex": "🆔 Введите Yandex Driver ID:",
-        "register_card": "💳 Введите номер карты (8600xxxxxx):",
-        "register_success": "✅ Вы зарегистрированы! После подтверждения менеджером ваш аккаунт будет активирован.",
-        "register_exists": "❌ Вы уже зарегистрированы!",
+        "register_phone": "📞 Введите номер телефона:",
+        "register_card": "💳 Введите номер карты:",
+        "register_success": "✅ Вы зарегистрированы!",
+        "new_request": "🆕 НОВАЯ ЗАЯВКА #{id}\n\n👤 {name}\n📞 {phone}\n💳 ****{card}\n💰 Баланс: {balance}\n💵 Сумма: {amount} сум",
+        "paid_notify": "✅ По вашей заявке #{id} выплачено {amount} сум!",
+        "admin_new": "📋 Новые заявки:",
+        "admin_no_requests": "📭 Новых заявок нет",
+        "admin_stats": "📊 СТАТИСТИКА\n\n👥 Пользователей: {users}\n💰 Всего выплат: {total_paid} сум\n📝 Ожидают: {pending} шт",
     }
 }
 
-# ==================== FSM СОСТОЯНИЯ ====================
+# ==================== КЛАВИАТУРЫ ====================
+def get_driver_keyboard(lang):
+    texts = TEXTS[lang]["menu"].split("\n")
+    buttons = [[KeyboardButton(text=text)] for text in texts]
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
+def get_admin_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📋 Yangi so'rovlar"), KeyboardButton(text="📊 Statistika")]],
+        resize_keyboard=True
+    )
+
+# ==================== FSM ====================
 class RegisterState(StatesGroup):
     name = State()
     phone = State()
-    yandex_id = State()
     card = State()
 
 class WithdrawState(StatesGroup):
     amount = State()
 
-# ==================== КЛАВИАТУРЫ ====================
-def get_driver_keyboard(lang: str):
-    texts = TEXTS[lang]["menu"].split("\n")
-    buttons = [[KeyboardButton(text=text)] for text in texts]
-    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+# ==================== БОТ ====================
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
 
-def get_manager_keyboard():
-    buttons = [[KeyboardButton(text="📋 Новые заявки")]]
-    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
-
-# ==================== УВЕДОМЛЕНИЯ МЕНЕДЖЕРАМ ====================
-async def notify_managers(text: str, reply_markup: InlineKeyboardMarkup = None):
-    for mgr_id in MANAGER_IDS:
-        try:
-            mgr_bot = Bot(token=MANAGER_BOT_TOKEN)
-            await mgr_bot.send_message(mgr_id, text, reply_markup=reply_markup)
-        except:
-            pass
-
-# ==================== DRIVER BOT ====================
-driver_bot = Bot(token=DRIVER_BOT_TOKEN)
-driver_storage = MemoryStorage()
-driver_dp = Dispatcher(storage=driver_storage)
-
-@driver_dp.message(F.text == "/start")
-async def driver_start(message: types.Message, state: FSMContext):
+@dp.message(F.text == "/start")
+async def start(message: types.Message, state: FSMContext):
     await state.clear()
-    db = next(get_db())
-    driver = db.query(Driver).filter(Driver.telegram_id == message.from_user.id).first()
-
+    driver = get_driver(message.from_user.id)
+    
     if driver:
-        await message.answer(TEXTS[driver.language]["menu"], reply_markup=get_driver_keyboard(driver.language))
+        lang = driver[7]
+        await message.answer(TEXTS[lang]["menu"], reply_markup=get_driver_keyboard(lang))
+    elif is_admin(message.from_user.id):
+        await message.answer("👨‍💼 Admin panel", reply_markup=get_admin_keyboard())
     else:
         await message.answer("🇺🇿 Assalomu alaykum! / 🇷🇺 Добро пожаловать!\n\n" + TEXTS["uz"]["register_name"])
         await state.set_state(RegisterState.name)
 
-# Регистрация
-@driver_dp.message(RegisterState.name)
+@dp.message(RegisterState.name)
 async def reg_name(message: types.Message, state: FSMContext):
     await state.update_data(name=message.text)
     await state.set_state(RegisterState.phone)
     await message.answer(TEXTS["uz"]["register_phone"])
 
-@driver_dp.message(RegisterState.phone)
+@dp.message(RegisterState.phone)
 async def reg_phone(message: types.Message, state: FSMContext):
     await state.update_data(phone=message.text)
-    await state.set_state(RegisterState.yandex_id)
-    await message.answer(TEXTS["uz"]["register_yandex"])
-
-@driver_dp.message(RegisterState.yandex_id)
-async def reg_yandex(message: types.Message, state: FSMContext):
-    await state.update_data(yandex_id=message.text)
     await state.set_state(RegisterState.card)
     await message.answer(TEXTS["uz"]["register_card"])
 
-@driver_dp.message(RegisterState.card)
+@dp.message(RegisterState.card)
 async def reg_card(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    db = next(get_db())
-
-    existing = db.query(Driver).filter(Driver.telegram_id == message.from_user.id).first()
+    
+    existing = get_driver(message.from_user.id)
     if existing:
-        await message.answer(TEXTS["uz"]["register_exists"])
+        await message.answer("❌ Siz allaqachon ro'yxatdan o'tgansiz!")
         await state.clear()
         return
-
-    new_driver = Driver(
-        telegram_id=message.from_user.id,
-        full_name=data['name'],
-        phone=data['phone'],
-        yandex_driver_id=data['yandex_id'],
-        card_number=message.text,
-        status="pending",
-        balance=0,
-        language="uz"
-    )
-    db.add(new_driver)
-    db.commit()
-
+    
+    create_driver(message.from_user.id, data['name'], data['phone'], message.text)
     await message.answer(TEXTS["uz"]["register_success"])
     await message.answer(TEXTS["uz"]["menu"], reply_markup=get_driver_keyboard("uz"))
     await state.clear()
 
-    await notify_managers(
-        f"🆕 НОВЫЙ ВОДИТЕЛЬ!\n\n"
-        f"👤 {data['name']}\n"
-        f"📞 {data['phone']}\n"
-        f"🆔 {data['yandex_id']}\n"
-        f"💳 ****{data['card'][-4:]}"
-    )
-
-@driver_dp.message(F.text.in_(["💰 Balansim", "💰 Мой баланс"]))
+# ==================== ДЛЯ ВОДИТЕЛЕЙ ====================
+@dp.message(F.text.in_(["💰 Balansim", "💰 Мой баланс"]))
 async def show_balance(message: types.Message):
-    db = next(get_db())
-    driver = db.query(Driver).filter(Driver.telegram_id == message.from_user.id).first()
+    driver = get_driver(message.from_user.id)
     if not driver:
-        await message.answer("❌ Ro'yxatdan o'ting / Зарегистрируйтесь")
+        await message.answer("❌ Ro'yxatdan o'ting!")
         return
-    available = max(0, driver.balance - NON_WITHDRAWABLE)
-    await message.answer(TEXTS[driver.language]["balance"].format(balance=int(driver.balance), available=int(available)))
+    
+    balance = driver[5]
+    available = max(0, balance - 10000)
+    lang = driver[7]
+    await message.answer(TEXTS[lang]["balance"].format(balance=int(balance), available=int(available)))
 
-@driver_dp.message(F.text.in_(["🚖 Buyurtmalarim", "🚖 Мои заказы"]))
+@dp.message(F.text.in_(["🚖 Buyurtmalarim", "🚖 Мои заказы"]))
 async def show_orders(message: types.Message):
-    db = next(get_db())
-    driver = db.query(Driver).filter(Driver.telegram_id == message.from_user.id).first()
+    driver = get_driver(message.from_user.id)
     if not driver:
-        await message.answer("❌ Ro'yxatdan o'ting")
+        await message.answer("❌ Ro'yxatdan o'ting!")
         return
+    lang = driver[7]
+    await message.answer(TEXTS[lang]["orders"])
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-
-    today_data = await yandex_api.get_driver_orders(driver.yandex_driver_id, today, today)
-    week_data = await yandex_api.get_driver_orders(driver.yandex_driver_id, week_ago, today)
-
-    await message.answer(
-        f"{TEXTS[driver.language]['orders_today'].format(orders=today_data['orders'], earned=int(today_data['earned']))}\n\n"
-        f"{TEXTS[driver.language]['orders_week'].format(orders=week_data['orders'], earned=int(week_data['earned']))}"
-    )
-
-@driver_dp.message(F.text.in_(["💸 Pul yechish", "💸 Вывести деньги"]))
+@dp.message(F.text.in_(["💸 Pul yechish", "💸 Вывести деньги"]))
 async def start_withdraw(message: types.Message, state: FSMContext):
-    db = next(get_db())
-    driver = db.query(Driver).filter(Driver.telegram_id == message.from_user.id).first()
-
+    driver = get_driver(message.from_user.id)
     if not driver:
-        await message.answer("❌ Ro'yxatdan o'ting")
+        await message.answer("❌ Ro'yxatdan o'ting!")
         return
-
-    if driver.status == "blocked":
-        await message.answer(TEXTS[driver.language]["blocked"])
-        return
-
-    active = db.query(WithdrawRequest).filter(
-        WithdrawRequest.driver_id == driver.id,
-        WithdrawRequest.status.in_(["new", "taken", "processing"])
-    ).first()
-
-    if active:
-        await message.answer(TEXTS[driver.language]["active_request"])
-        return
-
-    available = max(0, driver.balance - NON_WITHDRAWABLE)
+    
+    balance = driver[5]
+    available = max(0, balance - 10000)
+    lang = driver[7]
+    
     if available <= 0:
-        await message.answer(TEXTS[driver.language]["insufficient"].format(available=0))
+        await message.answer(TEXTS[lang]["insufficient"].format(available=0))
         return
-
+    
+    await state.update_data(driver_id=driver[0])
     await state.set_state(WithdrawState.amount)
-    await message.answer(TEXTS[driver.language]["enter_amount"])
+    await message.answer(TEXTS[lang]["enter_amount"])
 
-@driver_dp.message(WithdrawState.amount)
+@dp.message(WithdrawState.amount)
 async def process_withdraw(message: types.Message, state: FSMContext):
     try:
         amount = float(message.text)
-        if amount <= 0:
-            raise ValueError
     except:
-        await message.answer("❌ Iltimos, to'g'ri summa kiriting!")
+        await message.answer("❌ Faqat son kiriting!")
         return
-
-    db = next(get_db())
-    driver = db.query(Driver).filter(Driver.telegram_id == message.from_user.id).first()
-    available = max(0, driver.balance - NON_WITHDRAWABLE)
-
-    if amount > available:
-        await message.answer(TEXTS[driver.language]["insufficient"].format(available=int(available)))
+    
+    data = await state.get_data()
+    driver_id = data['driver_id']
+    
+    conn = sqlite3.connect("taxi.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT balance, language, full_name, phone, card_number FROM drivers WHERE id = ?", (driver_id,))
+    driver = cursor.fetchone()
+    conn.close()
+    
+    balance = driver[0]
+    lang = driver[1]
+    available = max(0, balance - 10000)
+    
+    if amount <= 0 or amount > available:
+        await message.answer(TEXTS[lang]["insufficient"].format(available=int(available)))
         await state.clear()
         return
-
-    withdraw = WithdrawRequest(driver_id=driver.id, amount=amount, status="new")
-    db.add(withdraw)
-    db.commit()
-
-    await message.answer(TEXTS[driver.language]["success"].format(id=withdraw.id))
+    
+    withdraw_id = create_withdraw(driver_id, amount)
+    
+    await message.answer(TEXTS[lang]["success"].format(id=withdraw_id))
     await state.clear()
-
-    for mgr_id in MANAGER_IDS:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Взять в работу", callback_data=f"take_{withdraw.id}")],
-            [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{withdraw.id}")],
-            [InlineKeyboardButton(text="👤 Профиль", callback_data=f"profile_{driver.id}")],
-            [InlineKeyboardButton(text="💸 Выплачено", callback_data=f"paid_{withdraw.id}")]
-        ])
-        text = (
-            f"🆕 НОВАЯ ЗАЯВКА #{withdraw.id}\n\n"
-            f"👤 {driver.full_name}\n"
-            f"📞 {driver.phone}\n"
-            f"💳 ****{driver.card_number[-4:]}\n"
-            f"💰 Баланс: {int(driver.balance)} сум\n"
-            f"💸 Доступно: {int(available)} сум\n"
-            f"💵 Сумма: {int(amount)} сум"
+    
+    # Отправляем уведомление админу
+    if ADMIN_ID:
+        text = TEXTS[lang]["new_request"].format(
+            id=withdraw_id,
+            name=driver[2],
+            phone=driver[3],
+            card=driver[4][-4:],
+            balance=int(balance),
+            amount=int(amount)
         )
-        try:
-            mgr_bot = Bot(token=MANAGER_BOT_TOKEN)
-            await mgr_bot.send_message(mgr_id, text, reply_markup=kb)
-        except:
-            pass
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Выплачено", callback_data=f"pay_{withdraw_id}")],
+            [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{withdraw_id}")]
+        ])
+        await bot.send_message(ADMIN_ID, text, reply_markup=kb)
 
-@driver_dp.message(F.text.in_(["📜 To'lovlar tarixi", "📜 История выплат"]))
+@dp.message(F.text.in_(["📜 To'lovlar tarixi", "📜 История выплат"]))
 async def show_history(message: types.Message):
-    db = next(get_db())
-    driver = db.query(Driver).filter(Driver.telegram_id == message.from_user.id).first()
+    driver = get_driver(message.from_user.id)
     if not driver:
         return
-
-    history = db.query(WithdrawRequest).filter(
-        WithdrawRequest.driver_id == driver.id,
-        WithdrawRequest.status == "paid"
-    ).order_by(WithdrawRequest.created_at.desc()).limit(10).all()
-
+    
+    history = get_paid_history(driver[0])
+    lang = driver[7]
+    
     if not history:
-        await message.answer(TEXTS[driver.language]["no_history"])
+        await message.answer(TEXTS[lang]["no_history"])
         return
-
-    text = TEXTS[driver.language]["history_header"]
+    
+    text = TEXTS[lang]["history"]
     for h in history:
-        text += f"#{h.id} - {int(h.amount)} so'm - {h.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+        text += f"#{h[0]} - {int(h[2])} so'm - {h[5][:16]}\n"
     await message.answer(text)
 
-@driver_dp.message(F.text.in_(["💳 Kartam", "💳 Моя карта"]))
+@dp.message(F.text.in_(["💳 Kartam", "💳 Моя карта"]))
 async def show_card(message: types.Message):
-    db = next(get_db())
-    driver = db.query(Driver).filter(Driver.telegram_id == message.from_user.id).first()
+    driver = get_driver(message.from_user.id)
     if not driver:
         return
-    masked = driver.card_number[-4:] if len(driver.card_number) >= 4 else "****"
-    await message.answer(TEXTS[driver.language]["card"].format(card=masked))
+    lang = driver[7]
+    masked = driver[4][-4:] if len(driver[4]) >= 4 else "****"
+    await message.answer(TEXTS[lang]["card"].format(card=masked))
 
-@driver_dp.message(F.text.in_(["☎️ Yordam", "☎️ Помощь"]))
+@dp.message(F.text.in_(["☎️ Yordam", "☎️ Помощь"]))
 async def show_help(message: types.Message):
-    db = next(get_db())
-    driver = db.query(Driver).filter(Driver.telegram_id == message.from_user.id).first()
-    lang = driver.language if driver else "uz"
+    driver = get_driver(message.from_user.id)
+    lang = driver[7] if driver else "uz"
     await message.answer(TEXTS[lang]["help"])
 
-@driver_dp.message(F.text.in_(["🌐 Tilni almashtirish", "🌐 Сменить язык"]))
-async def change_language(message: types.Message):
-    db = next(get_db())
-    driver = db.query(Driver).filter(Driver.telegram_id == message.from_user.id).first()
+@dp.message(F.text.in_(["🌐 Tilni almashtirish", "🌐 Сменить язык"]))
+async def change_lang(message: types.Message):
+    driver = get_driver(message.from_user.id)
     if driver:
-        new_lang = "ru" if driver.language == "uz" else "uz"
-        driver.language = new_lang
-        db.commit()
+        new_lang = "ru" if driver[7] == "uz" else "uz"
+        conn = sqlite3.connect("taxi.db")
+        cursor = conn.cursor()
+        cursor.execute("UPDATE drivers SET language = ? WHERE telegram_id = ?", (new_lang, message.from_user.id))
+        conn.commit()
+        conn.close()
         await message.answer(TEXTS[new_lang]["lang_changed"])
         await message.answer(TEXTS[new_lang]["menu"], reply_markup=get_driver_keyboard(new_lang))
 
-# ==================== MANAGER BOT ====================
-manager_bot = Bot(token=MANAGER_BOT_TOKEN)
-manager_storage = MemoryStorage()
-manager_dp = Dispatcher(storage=manager_storage)
-
-@manager_dp.message(F.text == "/start")
-async def manager_start(message: types.Message):
-    if message.from_user.id not in MANAGER_IDS:
-        await message.answer("⛔ У вас нет доступа к этому боту!")
+# ==================== ДЛЯ АДМИНА ====================
+@dp.message(F.text == "📋 Yangi so'rovlar")
+async def admin_new_requests(message: types.Message):
+    if not is_admin(message.from_user.id):
         return
-    await message.answer("👨‍💼 Панель менеджера\n\nНовые заявки приходят автоматически.", reply_markup=get_manager_keyboard())
-
-@manager_dp.message(F.text == "📋 Новые заявки")
-async def show_new_requests(message: types.Message):
-    if message.from_user.id not in MANAGER_IDS:
-        return
-
-    db = next(get_db())
-    requests = db.query(WithdrawRequest).filter(WithdrawRequest.status == "new").all()
-
+    
+    requests = get_new_withdraws()
+    
     if not requests:
-        await message.answer("📭 Новых заявок нет")
+        await message.answer(TEXTS["uz"]["admin_no_requests"])
         return
-
+    
+    await message.answer(TEXTS["uz"]["admin_new"])
     for req in requests:
-        driver = db.query(Driver).filter(Driver.id == req.driver_id).first()
-        available = max(0, driver.balance - NON_WITHDRAWABLE)
-
+        text = TEXTS["uz"]["new_request"].format(
+            id=req[0],
+            name=req[6],
+            phone=req[7],
+            card=req[8][-4:],
+            balance=0,
+            amount=int(req[2])
+        )
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Взять в работу", callback_data=f"take_{req.id}")],
-            [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{req.id}")],
-            [InlineKeyboardButton(text="👤 Профиль", callback_data=f"profile_{driver.id}")],
-            [InlineKeyboardButton(text="💸 Выплачено", callback_data=f"paid_{req.id}")]
+            [InlineKeyboardButton(text="✅ Выплачено", callback_data=f"pay_{req[0]}")],
+            [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{req[0]}")]
         ])
+        await message.answer(text, reply_markup=kb)
 
-        await message.answer(
-            f"🆕 ЗАЯВКА #{req.id}\n\n"
-            f"👤 {driver.full_name}\n"
-            f"📞 {driver.phone}\n"
-            f"💳 ****{driver.card_number[-4:]}\n"
-            f"💰 Баланс: {int(driver.balance)} сум\n"
-            f"💸 Доступно: {int(available)} сум\n"
-            f"💵 Сумма: {int(req.amount)} сум",
-            reply_markup=kb
-        )
-
-@manager_dp.callback_query(F.data.startswith("take_"))
-async def take_request(callback: types.CallbackQuery):
-    withdraw_id = int(callback.data.split("_")[1])
-    db = next(get_db())
-
-    withdraw = db.query(WithdrawRequest).filter(
-        WithdrawRequest.id == withdraw_id,
-        WithdrawRequest.status == "new"
-    ).first()
-
-    if not withdraw:
-        await callback.answer("❌ Заявка уже обработана!")
+@dp.message(F.text == "📊 Statistika")
+async def admin_stats(message: types.Message):
+    if not is_admin(message.from_user.id):
         return
+    
+    users, total_paid, pending = get_stats()
+    await message.answer(TEXTS["uz"]["admin_stats"].format(
+        users=users,
+        total_paid=int(total_paid),
+        pending=pending
+    ))
 
-    withdraw.status = "taken"
-    withdraw.manager_telegram_id = callback.from_user.id
-    db.commit()
-
-    await callback.message.edit_text(f"✅ Заявка #{withdraw_id} взята в работу!", reply_markup=None)
-    await callback.answer("✅ Взято!")
-
-    driver = db.query(Driver).filter(Driver.id == withdraw.driver_id).first()
+@dp.callback_query(F.data.startswith("pay_"))
+async def pay_request(callback: types.CallbackQuery):
+    withdraw_id = int(callback.data.split("_")[1])
+    
+    withdraw = get_withdraw(withdraw_id)
+    if not withdraw:
+        await callback.answer("❌ So'rov topilmadi!")
+        return
+    
+    if withdraw[3] != "new":
+        await callback.answer("❌ So'rov allaqachon ishlangan!")
+        return
+    
+    # Обновляем баланс водителя
+    balance = get_driver_balance(withdraw[1])
+    new_balance = balance - withdraw[2]
+    update_driver_balance(withdraw[1], new_balance)
+    
+    # Обновляем статус заявки
+    update_withdraw_status(withdraw_id, "paid")
+    
+    await callback.message.edit_text(f"✅ Заявка #{withdraw_id} выплачена! Сумма: {int(withdraw[2])} so'm")
+    await callback.answer("✅ Выплачено!")
+    
+    # Уведомляем водителя
     try:
-        await driver_bot.send_message(
-            driver.telegram_id,
-            f"✅ Ваша заявка #{withdraw_id} принята менеджером в работу!"
-        )
+        driver = get_driver(withdraw[5])
+        if driver:
+            lang = driver[7]
+            await bot.send_message(
+                withdraw[5],
+                TEXTS[lang]["paid_notify"].format(id=withdraw_id, amount=int(withdraw[2]))
+            )
     except:
         pass
 
-@manager_dp.callback_query(F.data.startswith("reject_"))
+@dp.callback_query(F.data.startswith("reject_"))
 async def reject_request(callback: types.CallbackQuery):
     withdraw_id = int(callback.data.split("_")[1])
-    db = next(get_db())
-
-    withdraw = db.query(WithdrawRequest).filter(WithdrawRequest.id == withdraw_id).first()
-    if not withdraw or withdraw.status != "new":
-        await callback.answer("❌ Заявка уже обработана!")
+    
+    withdraw = get_withdraw(withdraw_id)
+    if not withdraw:
+        await callback.answer("❌ So'rov topilmadi!")
         return
-
-    withdraw.status = "rejected"
-    withdraw.manager_telegram_id = callback.from_user.id
-    db.commit()
-
-    await callback.message.edit_text(f"❌ Заявка #{withdraw_id} отклонена!", reply_markup=None)
+    
+    if withdraw[3] != "new":
+        await callback.answer("❌ So'rov allaqachon ishlangan!")
+        return
+    
+    update_withdraw_status(withdraw_id, "rejected")
+    
+    await callback.message.edit_text(f"❌ Заявка #{withdraw_id} отклонена!")
     await callback.answer("❌ Отклонено!")
-
-    driver = db.query(Driver).filter(Driver.id == withdraw.driver_id).first()
+    
+    # Уведомляем водителя
     try:
-        await driver_bot.send_message(
-            driver.telegram_id,
-            f"❌ Ваша заявка #{withdraw_id} на сумму {int(withdraw.amount)} сум отклонена менеджером."
-        )
+        driver = get_driver(withdraw[5])
+        if driver:
+            lang = driver[7]
+            await bot.send_message(
+                withdraw[5],
+                f"❌ Sizning #{withdraw_id} so'rovingiz {int(withdraw[2])} so'm miqdorida rad etildi!"
+            )
     except:
         pass
-
-@manager_dp.callback_query(F.data.startswith("paid_"))
-async def paid_request(callback: types.CallbackQuery):
-    withdraw_id = int(callback.data.split("_")[1])
-    db = next(get_db())
-
-    withdraw = db.query(WithdrawRequest).filter(WithdrawRequest.id == withdraw_id).first()
-    if not withdraw or withdraw.status not in ["taken", "processing"]:
-        await callback.answer("❌ Заявка не в работе!")
-        return
-
-    driver = db.query(Driver).filter(Driver.id == withdraw.driver_id).first()
-
-    prev_balance = driver.balance
-    driver.balance -= withdraw.amount
-    withdraw.status = "paid"
-    withdraw.completed_at = datetime.utcnow()
-    withdraw.manager_telegram_id = callback.from_user.id
-
-    log = PayoutLog(
-        withdraw_id=withdraw.id,
-        driver_id=driver.id,
-        amount=withdraw.amount,
-        previous_balance=prev_balance,
-        new_balance=driver.balance
-    )
-    db.add(log)
-    db.commit()
-
-    await callback.message.edit_text(
-        f"✅ Выплата #{withdraw_id} подтверждена!\nСумма: {int(withdraw.amount)} сум\nВодитель: {driver.full_name}",
-        reply_markup=None
-    )
-    await callback.answer("✅ Выплачено!")
-
-    try:
-        await driver_bot.send_message(
-            driver.telegram_id,
-            f"✅ ВЫПЛАТА #{withdraw_id} ПРОИЗВЕДЕНА!\n\n"
-            f"Сумма: {int(withdraw.amount)} сум\n"
-            f"Текущий баланс: {int(driver.balance)} сум"
-        )
-    except:
-        pass
-
-@manager_dp.callback_query(F.data.startswith("profile_"))
-async def show_profile(callback: types.CallbackQuery):
-    driver_id = int(callback.data.split("_")[1])
-    db = next(get_db())
-
-    driver = db.query(Driver).filter(Driver.id == driver_id).first()
-    if not driver:
-        await callback.answer("❌ Водитель не найден!")
-        return
-
-    available = max(0, driver.balance - NON_WITHDRAWABLE)
-
-    await callback.message.answer(
-        f"👤 ПРОФИЛЬ ВОДИТЕЛЯ\n\n"
-        f"Имя: {driver.full_name}\n"
-        f"Телефон: {driver.phone}\n"
-        f"Yandex ID: {driver.yandex_driver_id}\n"
-        f"Карта: ****{driver.card_number[-4:]}\n"
-        f"Статус: {driver.status}\n"
-        f"Баланс: {int(driver.balance)} сум\n"
-        f"Доступно: {int(available)} сум\n"
-        f"Язык: {'Узбекский' if driver.language == 'uz' else 'Русский'}\n"
-        f"Регистрация: {driver.created_at.strftime('%d.%m.%Y %H:%M')}"
-    )
-    await callback.answer()
-
-# ==================== FASTAPI ====================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    asyncio.create_task(driver_dp.start_polling(driver_bot))
-    asyncio.create_task(manager_dp.start_polling(manager_bot))
-    yield
-
-app = FastAPI(title="Yakomfort Taxi Payout", lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.get("/")
-async def root():
-    return {"status": "ok", "message": "Yakomfort Taxi Payout System"}
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
-
-@app.get("/api/drivers")
-async def get_drivers():
-    db = next(get_db())
-    drivers = db.query(Driver).all()
-    return [{"id": d.id, "name": d.full_name, "phone": d.phone, "balance": d.balance, "status": d.status} for d in drivers]
-
-@app.get("/api/withdraws")
-async def get_withdraws():
-    db = next(get_db())
-    withdraws = db.query(WithdrawRequest).all()
-    return [{"id": w.id, "amount": w.amount, "status": w.status, "created_at": w.created_at.isoformat()} for w in withdraws]
-
-@app.post("/api/sync_balance")
-async def sync_balance():
-    db = next(get_db())
-    drivers = db.query(Driver).filter(Driver.status == "active").all()
-
-    for driver in drivers:
-        balance = await yandex_api.get_driver_balance(driver.yandex_driver_id)
-        if balance is not None:
-            driver.balance = balance
-            db.commit()
-
-    return {"synced": len(drivers)}
 
 # ==================== ЗАПУСК ====================
+async def main():
+    print("Bot started!")
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    import asyncio
+    asyncio.run(main())
