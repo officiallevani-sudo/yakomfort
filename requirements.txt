@@ -1,7 +1,2 @@
-fastapi
-uvicorn
-sqlalchemy
 aiogram
 python-dotenv
-httpx
-psycopg2-binary
