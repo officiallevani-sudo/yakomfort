@@ -4,3 +4,4 @@ sqlalchemy
 aiogram
 python-dotenv
 httpx
+aiosqlite
