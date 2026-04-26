@@ -26,6 +26,9 @@ DRIVER_BOT_TOKEN = os.getenv("DRIVER_BOT_TOKEN")
 MANAGER_BOT_TOKEN = os.getenv("MANAGER_BOT_TOKEN")
 MANAGER_IDS = [int(x.strip()) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
 NON_WITHDRAWABLE = 10000
+print("DRIVER_BOT_TOKEN =", repr(DRIVER_BOT_TOKEN))
+print("MANAGER_BOT_TOKEN =", repr(MANAGER_BOT_TOKEN))
+print("MANAGER_IDS =", repr(os.getenv("MANAGER_IDS")))
 
 # Заглушка для Yandex API (позже подключите реальный)
 class YandexAPI:
