@@ -333,7 +333,6 @@ async def reg_card(m: types.Message, state: FSMContext):
         await state.clear()
         return
     
-    # Yangi driver yaratish, balans = 0
     create_driver(m.from_user.id, data['name'], data['car'], data['phone'], m.text, data['lang'])
     
     await m.answer(TEXTS[data['lang']]["register_success"])
@@ -351,30 +350,13 @@ async def show_trips(m: types.Message):
     
     lang = driver[11]
     await m.answer(TEXTS[lang]["my_trips"].format(
-        today_count=int(driver[6] or 0),
-        today_earn=int(driver[7] or 0),
+        today_count=int(driver[7] or 0),
+        today_earn=int(driver[9] or 0),
         week_count=int(driver[8] or 0),
-        week_earn=int(driver[9] or 0)
+        week_earn=int(driver[10] or 0)
     ))
 
 # ============ BALANCE ============
-@dp.message(F.text.in_(["💰 Balans", "💰 Баланс"]))
-async def show_balance(m: types.Message):
-    driver = get_driver(m.from_user.id)
-    if not driver:
-        await m.answer("❌ Iltimos, avval ro'yxatdan o'ting!\n/start")
-        return
-    
-    lang = driver[11]
-    balance = driver[5]
-    available = balance  # Hech qanday chegirmasiz
-    
-    await m.answer(TEXTS[lang]["balance"].format(
-        balance=int(balance),
-        available=int(available)
-    ))
-
-# ============ WITHDRAW ============
 @dp.message(F.text.in_(["💰 Pul yechish", "💰 Вывести деньги"]))
 async def start_withdraw(m: types.Message, state: FSMContext):
     driver = get_driver(m.from_user.id)
@@ -383,7 +365,7 @@ async def start_withdraw(m: types.Message, state: FSMContext):
         return
     
     lang = driver[11]
-    balance = driver[5]
+    balance = driver[6]
     available = balance
     
     if available <= 0:
@@ -409,7 +391,7 @@ async def process_withdraw(m: types.Message, state: FSMContext):
     if not driver: return
     
     lang = driver[11]
-    balance = driver[5]
+    balance = driver[6]
     
     if amount > balance:
         await m.answer(TEXTS[lang]["insufficient"].format(available=int(balance)))
@@ -627,6 +609,9 @@ async def admin_update_trip_finish(m: types.Message, state: FSMContext):
     try:
         week_earn = float(m.text)
         data = await state.get_data()
+        
+        # Xatolik tuzatildi - week_count ni to'g'ri ishlatish
+        week_count = data.get('week_count', 0)
         
         update_trips(data['driver_id'], data['today_count'], data['today_earn'], week_count, week_earn)
         
